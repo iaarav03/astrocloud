@@ -11,7 +11,8 @@ function initializeSocket(server) {
     "https://4b681p4d-3000.inc1.devtunnels.ms",
     "https://jyotishconnect.vercel.app",
     "https://4b681p4d-7000.inc1.devtunnels.ms",
-    "https://jyotishconnect.onrender.com"
+    "https://jyotishconnect.onrender.com",
+    "https://jyotish-frontend-new.vercel.app"
   ];
 
   const io = socketIO(server, {
