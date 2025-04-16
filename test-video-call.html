@@ -1,0 +1,362 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Video Call Test</title>
+    <script src="https://cdn.socket.io/4.4.1/socket.io.min.js"></script>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 0; padding: 20px; }
+        .container { max-width: 800px; margin: 0 auto; }
+        .panel { border: 1px solid #ccc; padding: 15px; margin-bottom: 15px; border-radius: 5px; }
+        .video-container { display: flex; gap: 10px; margin-top: 15px; }
+        .video-box { width: 48%; border: 1px solid #ddd; height: 240px; background-color: #f5f5f5; }
+        #local-video, #remote-video { width: 100%; height: 100%; object-fit: cover; }
+        input, button { padding: 8px; margin: 5px 0; }
+        button { cursor: pointer; background-color: #4CAF50; color: white; border: none; border-radius: 5px; }
+        .call-controls { display: flex; gap: 10px; margin-top: 10px; }
+        .red-button { background-color: #f44336; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Video Call Test Interface</h1>
+        
+        <div class="panel">
+            <h3>1. Login</h3>
+            <div>
+                <label>Email:</label>
+                <input type="email" id="email" placeholder="Email">
+                <label>Password:</label>
+                <input type="password" id="password" placeholder="Password">
+                <button onclick="login()">Login</button>
+            </div>
+            <div id="login-status"></div>
+        </div>
+
+        <div class="panel">
+            <h3>2. Call Controls</h3>
+            <div>
+                <label>Recipient ID:</label>
+                <input type="text" id="recipient-id" placeholder="User/Astrologer ID">
+                <button id="call-button" onclick="startCall()">Start Call</button>
+            </div>
+            <div id="call-status"></div>
+            
+            <div class="video-container">
+                <div class="video-box">
+                    <video id="local-video" autoplay muted></video>
+                </div>
+                <div class="video-box">
+                    <video id="remote-video" autoplay></video>
+                </div>
+            </div>
+            
+            <div class="call-controls">
+                <button id="toggle-audio" onclick="toggleAudio()">Mute</button>
+                <button id="toggle-video" onclick="toggleVideo()">Hide Video</button>
+                <button class="red-button" onclick="endCall()">End Call</button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let token = '';
+        let socket = null;
+        let userId = '';
+        let userName = '';
+        let userRole = '';
+        let currentCall = null;
+        let localStream = null;
+        let peerConnection = null;
+        let isAudioEnabled = true;
+        let isVideoEnabled = true;
+        
+        // WebRTC configuration
+        const configuration = {
+            iceServers: [
+                { urls: 'stun:stun.l.google.com:19302' },
+                { urls: 'stun:stun1.l.google.com:19302' }
+            ]
+        };
+        
+        async function login() {
+            const email = document.getElementById('email').value;
+            const password = document.getElementById('password').value;
+            
+            try {
+                const response = await fetch('http://localhost:7000/api/v1/login', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ email, password })
+                });
+                
+                const data = await response.json();
+                if (data.success) {
+                    token = data.token;
+                    userId = data.user._id;
+                    userName = data.user.name;
+                    userRole = data.user.role;
+                    document.getElementById('login-status').innerHTML = 
+                        `<p style="color: green;">Logged in as ${userName} (${userRole})</p>`;
+                    
+                    // Connect to socket after login
+                    connectSocket();
+                } else {
+                    document.getElementById('login-status').innerHTML = 
+                        `<p style="color: red;">Login failed: ${data.message}</p>`;
+                }
+            } catch (error) {
+                document.getElementById('login-status').innerHTML = 
+                    `<p style="color: red;">Error: ${error.message}</p>`;
+            }
+        }
+
+        function connectSocket() {
+            // Disconnect existing socket if any
+            if (socket) socket.disconnect();
+            
+            // Connect new socket with auth token
+            socket = io('http://localhost:7000', {
+                auth: { token }
+            });
+
+            socket.on('connect', () => {
+                console.log('Socket connected');
+                setupCallHandlers();
+            });
+
+            socket.on('connect_error', (err) => {
+                console.error('Socket connection error:', err.message);
+                document.getElementById('login-status').innerHTML += 
+                    `<p style="color: red;">Socket Error: ${err.message}</p>`;
+            });
+        }
+        
+        function setupCallHandlers() {
+            // Incoming call request
+            socket.on('callRequest', async (data) => {
+                const { callerId, callerName } = data;
+                
+                if (confirm(`Incoming call from ${callerName}. Accept?`)) {
+                    // Get user media before accepting
+                    try {
+                        localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+                        document.getElementById('local-video').srcObject = localStream;
+                        
+                        // Create peer connection
+                        createPeerConnection();
+                        
+                        // Add local stream tracks to peer connection
+                        localStream.getTracks().forEach(track => {
+                            peerConnection.addTrack(track, localStream);
+                        });
+                        
+                        // Accept the call
+                        socket.emit('callAccepted', { callerId });
+                        updateCallStatus(`Connected with ${callerName}`);
+                    } catch (error) {
+                        console.error('Error accessing media devices:', error);
+                        socket.emit('callRejected', { callerId, reason: 'Failed to access media devices' });
+                    }
+                } else {
+                    // Reject the call
+                    socket.emit('callRejected', { callerId, reason: 'Call rejected by user' });
+                }
+            });
+            
+            // Call accepted
+            socket.on('callAccepted', async ({ receiverId, receiverName }) => {
+                updateCallStatus(`${receiverName} accepted the call`);
+                
+                try {
+                    // Create offer
+                    const offer = await peerConnection.createOffer();
+                    await peerConnection.setLocalDescription(offer);
+                    
+                    // Send offer to receiver
+                    socket.emit('offer', {
+                        receiverId,
+                        offer: peerConnection.localDescription
+                    });
+                } catch (error) {
+                    console.error('Error creating offer:', error);
+                    endCall();
+                }
+            });
+            
+            // Call rejected
+            socket.on('callRejected', ({ reason }) => {
+                updateCallStatus(`Call rejected: ${reason}`);
+                cleanupCall();
+            });
+            
+            // Handle offer
+            socket.on('offer', async ({ callerId, offer }) => {
+                try {
+                    await peerConnection.setRemoteDescription(new RTCSessionDescription(offer));
+                    
+                    // Create answer
+                    const answer = await peerConnection.createAnswer();
+                    await peerConnection.setLocalDescription(answer);
+                    
+                    // Send answer to caller
+                    socket.emit('answer', {
+                        callerId,
+                        answer: peerConnection.localDescription
+                    });
+                } catch (error) {
+                    console.error('Error handling offer:', error);
+                    endCall();
+                }
+            });
+            
+            // Handle answer
+            socket.on('answer', async ({ answer }) => {
+                try {
+                    await peerConnection.setRemoteDescription(new RTCSessionDescription(answer));
+                } catch (error) {
+                    console.error('Error handling answer:', error);
+                    endCall();
+                }
+            });
+            
+            // Handle ICE candidate
+            socket.on('iceCandidate', async ({ candidate }) => {
+                try {
+                    if (candidate) {
+                        await peerConnection.addIceCandidate(new RTCIceCandidate(candidate));
+                    }
+                } catch (error) {
+                    console.error('Error adding ICE candidate:', error);
+                }
+            });
+            
+            // Call ended
+            socket.on('callEnded', () => {
+                updateCallStatus('Call ended by remote user');
+                cleanupCall();
+            });
+        }
+        
+        function createPeerConnection() {
+            // Cleanup existing connection if any
+            if (peerConnection) {
+                peerConnection.close();
+            }
+            
+            // Create new connection
+            peerConnection = new RTCPeerConnection(configuration);
+            
+            // Handle ICE candidates
+            peerConnection.onicecandidate = (event) => {
+                if (event.candidate) {
+                    socket.emit('iceCandidate', {
+                        receiverId: document.getElementById('recipient-id').value,
+                        candidate: event.candidate
+                    });
+                }
+            };
+            
+            // Handle connection state changes
+            peerConnection.onconnectionstatechange = (event) => {
+                console.log('Connection state:', peerConnection.connectionState);
+                if (peerConnection.connectionState === 'disconnected' || 
+                    peerConnection.connectionState === 'failed') {
+                    endCall();
+                }
+            };
+            
+            // Handle remote stream
+            peerConnection.ontrack = (event) => {
+                document.getElementById('remote-video').srcObject = event.streams[0];
+            };
+        }
+        
+        async function startCall() {
+            const receiverId = document.getElementById('recipient-id').value;
+            if (!receiverId || !socket) {
+                updateCallStatus('Please login and provide a recipient ID');
+                return;
+            }
+            
+            try {
+                // Get local media stream
+                localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+                document.getElementById('local-video').srcObject = localStream;
+                
+                // Create peer connection
+                createPeerConnection();
+                
+                // Add local stream tracks to peer connection
+                localStream.getTracks().forEach(track => {
+                    peerConnection.addTrack(track, localStream);
+                });
+                
+                // Request call
+                socket.emit('callRequest', { receiverId });
+                updateCallStatus('Calling...');
+            } catch (error) {
+                console.error('Error starting call:', error);
+                updateCallStatus(`Error: ${error.message}`);
+            }
+        }
+        
+        function endCall() {
+            // Notify other user
+            socket.emit('endCall', {
+                receiverId: document.getElementById('recipient-id').value
+            });
+            
+            // Cleanup
+            cleanupCall();
+            updateCallStatus('Call ended');
+        }
+        
+        function cleanupCall() {
+            // Stop local stream
+            if (localStream) {
+                localStream.getTracks().forEach(track => track.stop());
+                localStream = null;
+            }
+            
+            // Close peer connection
+            if (peerConnection) {
+                peerConnection.close();
+                peerConnection = null;
+            }
+            
+            // Clear video elements
+            document.getElementById('local-video').srcObject = null;
+            document.getElementById('remote-video').srcObject = null;
+        }
+        
+        function toggleAudio() {
+            if (localStream) {
+                const audioTrack = localStream.getAudioTracks()[0];
+                if (audioTrack) {
+                    isAudioEnabled = !isAudioEnabled;
+                    audioTrack.enabled = isAudioEnabled;
+                    document.getElementById('toggle-audio').textContent = 
+                        isAudioEnabled ? 'Mute' : 'Unmute';
+                }
+            }
+        }
+        
+        function toggleVideo() {
+            if (localStream) {
+                const videoTrack = localStream.getVideoTracks()[0];
+                if (videoTrack) {
+                    isVideoEnabled = !isVideoEnabled;
+                    videoTrack.enabled = isVideoEnabled;
+                    document.getElementById('toggle-video').textContent = 
+                        isVideoEnabled ? 'Hide Video' : 'Show Video';
+                }
+            }
+        }
+        
+        function updateCallStatus(message) {
+            document.getElementById('call-status').innerHTML = 
+                `<p>${message}</p>`;
+        }
+    </script>
+</body>
+</html> 
